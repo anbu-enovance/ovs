@@ -784,11 +784,14 @@ parse_macros(struct expr_context *ctx, struct expr_constant_set *cs,
     struct expr_constant_set *addr_set
         = shash_find_data(ctx->macros, ctx->lexer->token.s);
     if (!addr_set) {
-        expr_syntax_error(ctx, "Unknown macro: '%s'", ctx->lexer->token.s);
+        expr_syntax_error(ctx, "Unknown macro: '%s'.", ctx->lexer->token.s);
         return false;
     }
 
-    cs->type = EXPR_C_INTEGER;
+    if (!assign_constant_set_type(ctx, cs, EXPR_C_INTEGER)) {
+        return false;
+    }
+
     size_t n_values = cs->n_values + addr_set->n_values;
     if (n_values >= *allocated_values) {
         cs->values = xrealloc(cs->values, n_values * sizeof *cs->values);
