@@ -1889,6 +1889,11 @@ tcp.flags = RST;
         interface, in bits.
       </column>
 
+      <column name="options" key="qos_dscp">
+        If set, indicates the DSCP code to be marked on the packets egressing
+        the VIF interface. Value should be in the range of 0 to 63 (inclusive).
+      </column>
+
       <column name="options" key="qdisc_queue_id"
               type='{"type": "integer", "minInteger": 1, "maxInteger": 61440}'>
         Indicates the queue number on the physical device. This is same as the
