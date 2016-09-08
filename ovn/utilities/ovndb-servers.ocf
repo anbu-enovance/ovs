@@ -1,0 +1,180 @@
+#!/bin/bash
+
+: ${OCF_FUNCTIONS_DIR=${OCF_ROOT}/lib/heartbeat}
+. ${OCF_FUNCTIONS_DIR}/ocf-shellfuncs
+CRM_MASTER="${HA_SBIN_DIR}/crm_master -l reboot"
+CRM_ATTR_REPL_INFO="${HA_SBIN_DIR}/crm_attribute --type crm_config --name OVN_REPL_INFO -s ovn_ovsdb_master_server"
+OVN_CTL=${OCF_RESKEY_ovn_ctl}
+MASTER_IP=${OCF_RESKEY_master_ip}
+
+host_name=$(ocf_local_nodename)
+: ${slave_score=5}
+: ${master_score=10}
+
+ovsdb_server_metadata() {
+    cat <<END
+<?xml version="1.0"?>
+<!DOCTYPE resource-agent SYSTEM "ra-api-1.dtd">
+<resource-agent name="ovsdb-server">
+  <version>1.0</version>
+
+  <longdesc lang="en">
+    This resource manages ovsdb-server.
+  </longdesc>
+
+  <shortdesc lang="en">
+    Manages ovsdb-server.
+  </shortdesc>
+
+  <parameters>
+
+  <parameter name="ovn_ctl" unique="1">
+  <longdesc lang="en">
+  Location to the ovn-ctl script file
+  </longdesc>
+  <shortdesc lang="en">ovn-ctl script</shortdesc>
+  <content type="string" default="/usr/share/openvswitch/scripts/ovn-ctl" />
+  </parameter>
+
+  <parameter name="master_ip" unique="1">
+  <longdesc lang="en">
+  The IP address resource which will be available on the master ovsdb server
+  </longdesc>
+  <shortdesc lang="en">master ip address</shortdesc>
+  <content type="string" />
+  </parameter>
+
+  </parameters>
+
+  <actions>
+    <action name="start"        timeout="30s" />
+    <action name="stop"         timeout="20s" />
+    <action name="promote"      timeout="50s" />
+    <action name="demote"       timeout="50s" />
+    <action name="monitor"      timeout="20s"  depth="0" interval="10s" />
+    <action name="meta-data"    timeout="5s" />
+    <action name="validate-all" timeout="20s" />
+  </actions>
+</resource-agent>
+END
+    exit $OCF_SUCCESS
+}
+
+ovsdb_server_notify() {
+    local type_op="${OCF_RESKEY_CRM_meta_notify_type}-${OCF_RESKEY_CRM_meta_notify_operation}"
+
+    if [ "$type_op" == "post-promote" ]; then
+        ${OVN_CTL} demote_ovnnb --db-nb-sync-from-addr=${MASTER_IP}
+        ${OVN_CTL} demote_ovnsb --db-sb-sync-from-addr=${MASTER_IP}
+    fi
+}
+
+ovsdb_server_usage() {
+    cat <<END
+usage: $0 {start|stop|status|monitor|validate-all|meta-data}
+
+Expects to have a fully populated OCF RA-compliant environment set.
+END
+    exit $1
+}
+
+
+ovsdb_server_check_status() {
+    local sb_status=`${OVN_CTL} status_ovnsb`
+    local nb_status=`${OVN_CTL} status_ovnnb`
+
+    if [[ $sb_status == "running/backup" && $nb_status == "running/backup" ]]; then
+        return $OCF_SUCCESS
+    fi
+
+    if [[ $sb_status == "running/active" && $nb_status == "running/active" ]]; then
+        return $OCF_RUNNING_MASTER
+    fi
+
+    return $OCF_NOT_RUNNING
+}
+
+ovsdb_server_start() {
+    ovsdb_server_check_status
+    local status=$?
+    # If not in stopped state, return
+    if [ $status -ne $OCF_NOT_RUNNING ]; then
+        return $status
+    fi
+
+    local ret=$OCF_SUCCESS
+    local present_master=`$CRM_ATTR_REPL_INFO --query  -q 2>/dev/null`
+
+    set ${OVN_CTL}
+    if [ "$present_master" == "$host_name" ]; then
+        ret=$OCF_RUNNING_MASTER
+    else
+        set $@ --db-nb-sync-from-addr=${MASTER_IP} --db-sb-sync-from-addr=${MASTER_IP}
+    fi
+
+    $@ start_ovsdb
+
+    [ "$present_master" != "$host_name" ] && $CRM_MASTER -v ${slave_score}
+
+    return $ret
+}
+
+ovsdb_server_stop() {
+    local present_master=`$CRM_ATTR_REPL_INFO --query  -q 2>/dev/null`
+    [ "$present_master" == "$host_name" ] && $CRM_ATTR_REPL_INFO --delete
+
+    ${OVN_CTL} stop_ovsdb
+    $CRM_MASTER -D
+    return $OCF_SUCCESS
+}
+
+ovsdb_server_promote() {
+    ovsdb_server_check_status
+    if [ $? = $OCF_NOT_RUNNING ]; then
+        return $OCF_NOT_RUNNING
+    fi
+
+    ${OVN_CTL} promote_ovnnb
+    ${OVN_CTL} promote_ovnsb
+
+    $CRM_MASTER -v ${master_score}
+    ${CRM_ATTR_REPL_INFO} -v "$host_name"
+    return $OCF_SUCCESS
+}
+
+ovsdb_server_demote() {
+    ovsdb_server_check_status
+    if [ $? = $OCF_NOT_RUNNING ]; then
+        return $OCF_NOT_RUNNING
+    fi
+
+    ${OVN_CTL} demote_ovnnb --db-nb-sync-from-addr=${MASTER_IP}
+    ${OVN_CTL} demote_ovnsb --db-sb-sync-from-addr=${MASTER_IP}
+
+    $CRM_MASTER -v ${slave_score}
+    return $OCF_SUCCESS
+}
+
+ovsdb_server_validate() {
+    if [ ! -e ${OVN_CTL} ]; then
+        return $OCF_ERR_INSTALLED
+    fi
+    if [ -z ${MASTER_IP} ]; then
+        return $OCF_ERR_CONFIGURED
+    fi
+    return $OCF_SUCCESS
+}
+
+case $__OCF_ACTION in
+start)          ovsdb_server_start;;
+stop)           ovsdb_server_stop;;
+promote)        ovsdb_server_promote;;
+demote)         ovsdb_server_demote;;
+validate-all)   ovsdb_server_validate;;
+meta-data)      ovsdb_server_metadata;;
+status|monitor) ovsdb_server_check_status;;
+usage|help)     ovsdb_server_usage $OCF_SUCCESS;;
+*)              ovsdb_server_usage $OCF_ERR_UNIMPLEMENTED ;;
+esac
+
+exit $?
