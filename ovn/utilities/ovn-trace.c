@@ -658,47 +658,6 @@ read_flows(void)
 }
 
 static void
-read_mac_bindings(void)
-{
-    const struct sbrec_mac_binding *sbmb;
-    SBREC_MAC_BINDING_FOR_EACH (sbmb, ovnsb_idl) {
-        const struct ovntrace_port *port = shash_find_data(
-            &ports, sbmb->logical_port);
-        if (!port) {
-            VLOG_WARN("missing port %s", sbmb->logical_port);
-            continue;
-        }
-
-        if (!uuid_equals(&port->dp->sb_uuid, &sbmb->datapath->header_.uuid)) {
-            VLOG_WARN("port %s is in wrong datapath", sbmb->logical_port);
-            continue;
-        }
-
-        struct in6_addr ip6;
-        ovs_be32 ip4;
-        if (ip_parse(sbmb->ip, &ip4)) {
-            ip6 = in6_addr_mapped_ipv4(ip4);
-        } else if (!ipv6_parse(sbmb->ip, &ip6)) {
-            VLOG_WARN("%s: bad IP address", sbmb->ip);
-            continue;
-        }
-
-        struct eth_addr mac;
-        if (!eth_addr_from_string(sbmb->mac, &mac)) {
-            VLOG_WARN("%s: bad Ethernet address", sbmb->mac);
-            continue;
-        }
-
-        struct ovntrace_mac_binding *binding = xmalloc(sizeof *binding);
-        binding->port_key = port->tunnel_key;
-        binding->ip = ip6;
-        binding->mac = mac;
-        hmap_insert(&port->dp->mac_bindings, &binding->node,
-                    hash_mac_binding(binding->port_key, &ip6));
-    }
-}
-
-static void
 read_db(void)
 {
     read_datapaths();
@@ -706,7 +665,6 @@ read_db(void)
     read_mcgroups();
     read_address_sets();
     read_flows();
-    read_mac_bindings();
 }
 
 static bool

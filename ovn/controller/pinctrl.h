@@ -27,11 +27,17 @@ struct ovsrec_bridge;
 struct controller_ctx;
 
 void pinctrl_init(void);
-void pinctrl_run(struct controller_ctx *, const struct lport_index *,
+void pinctrl_run(const struct lport_index *,
                  const struct ovsrec_bridge *,
                  const char *chassis_id,
                  struct hmap *local_datapaths);
-void pinctrl_wait(struct controller_ctx *);
+void pinctrl_wait(void);
 void pinctrl_destroy(void);
+void pinctrl_put_mac_binding_for_each(void (*iteration_cb)(void *private_data,
+                                                           uint32_t port_key,
+                                                           uint32_t dp_key,
+                                                           const char *ip_s,
+                                                           const struct eth_addr *mac),
+                                      void *private_data);
 
 #endif /* ovn/pinctrl.h */

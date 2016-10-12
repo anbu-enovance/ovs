@@ -27,6 +27,7 @@
 #include "ovn/lib/ovn-dhcp.h"
 #include "ovn/lib/ovn-sb-idl.h"
 #include "packets.h"
+#include "pinctrl.h"
 #include "physical.h"
 #include "simap.h"
 #include "sset.h"
@@ -341,38 +342,31 @@ put_load(const uint8_t *data, size_t len,
     bitwise_one(ofpact_set_field_mask(sf), sf->field->n_bytes, ofs, n_bits);
 }
 
+struct put_mac_binding_context {
+    const struct lport_index *lports;
+    struct hmap *flow_table;
+};
+
 static void
-consider_neighbor_flow(const struct lport_index *lports,
-                       const struct sbrec_mac_binding *b,
+consider_neighbor_flow(const struct sbrec_port_binding *pb,
+                       const char *ip_s,
+                       const struct eth_addr *mac,
                        struct hmap *flow_table)
 {
-    const struct sbrec_port_binding *pb
-        = lport_lookup_by_name(lports, b->logical_port);
-    if (!pb) {
-        return;
-    }
-
-    struct eth_addr mac;
-    if (!eth_addr_from_string(b->mac, &mac)) {
-        static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(5, 1);
-        VLOG_WARN_RL(&rl, "bad 'mac' %s", b->mac);
-        return;
-    }
-
     struct match match = MATCH_CATCHALL_INITIALIZER;
-    if (strchr(b->ip, '.')) {
+    if (strchr(ip_s, '.')) {
         ovs_be32 ip;
-        if (!ip_parse(b->ip, &ip)) {
+        if (!ip_parse(ip_s, &ip)) {
             static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(5, 1);
-            VLOG_WARN_RL(&rl, "bad 'ip' %s", b->ip);
+            VLOG_WARN_RL(&rl, "bad 'ip' %s", ip_s);
             return;
         }
         match_set_reg(&match, 0, ntohl(ip));
     } else {
         struct in6_addr ip6;
-        if (!ipv6_parse(b->ip, &ip6)) {
+        if (!ipv6_parse(ip_s, &ip6)) {
             static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(5, 1);
-            VLOG_WARN_RL(&rl, "bad 'ip' %s", b->ip);
+            VLOG_WARN_RL(&rl, "bad 'ip' %s", ip_s);
             return;
         }
         ovs_be128 value;
@@ -385,24 +379,44 @@ consider_neighbor_flow(const struct lport_index *lports,
 
     uint64_t stub[1024 / 8];
     struct ofpbuf ofpacts = OFPBUF_STUB_INITIALIZER(stub);
-    put_load(mac.ea, sizeof mac.ea, MFF_ETH_DST, 0, 48, &ofpacts);
+    put_load(mac->ea, sizeof mac->ea, MFF_ETH_DST, 0, 48, &ofpacts);
     ofctrl_add_flow(flow_table, OFTABLE_MAC_BINDING, 100, &match, &ofpacts);
     ofpbuf_uninit(&ofpacts);
+}
+
+static void
+mac_binding_iteration_cb(void *private_data,
+                         uint32_t port_key,
+                         uint32_t dp_key,
+                         const char *ip_s,
+                         const struct eth_addr *mac) {
+    struct put_mac_binding_context *mb_ctx = private_data;
+    const struct sbrec_port_binding *pb
+        = lport_lookup_by_key(mb_ctx->lports, dp_key, port_key);
+    if (!pb) {
+        static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(1, 5);
+
+        VLOG_WARN_RL(&rl, "unknown logical port with datapath %"PRIu32" "
+                     "and port %"PRIu32, dp_key, port_key);
+        return;
+    }
+
+    consider_neighbor_flow(pb, ip_s, mac, mb_ctx->flow_table);
 }
 
 /* Adds an OpenFlow flow to flow tables for each MAC binding in the OVN
  * southbound database, using 'lports' to resolve logical port names to
  * numbers. */
 static void
-add_neighbor_flows(struct controller_ctx *ctx,
-                   const struct lport_index *lports,
+add_neighbor_flows(const struct lport_index *lports,
                    struct hmap *flow_table)
 {
-    const struct sbrec_mac_binding *b;
-    SBREC_MAC_BINDING_FOR_EACH (b, ctx->ovnsb_idl) {
-        consider_neighbor_flow(lports, b, flow_table);
-    }
+    struct put_mac_binding_context pmb_ctx = {.lports = lports,
+        .flow_table = flow_table};
+
+    pinctrl_put_mac_binding_for_each(mac_binding_iteration_cb, &pmb_ctx);
 }
+
 
 /* Translates logical flows in the Logical_Flow table in the OVN_SB database
  * into OpenFlow flows.  See ovn-architecture(7) for more information. */
@@ -421,7 +435,7 @@ lflow_run(struct controller_ctx *ctx, const struct lport_index *lports,
     add_logical_flows(ctx, lports, mcgroups, local_datapaths,
                       patched_datapaths, group_table, ct_zones, flow_table,
                       &expr_address_sets);
-    add_neighbor_flows(ctx, lports, flow_table);
+    add_neighbor_flows(lports, flow_table);
 
     expr_macros_destroy(&expr_address_sets);
     shash_destroy(&expr_address_sets);

@@ -540,7 +540,7 @@ main(int argc, char *argv[])
             enum mf_field_id mff_ovn_geneve = ofctrl_run(br_int,
                                                          &pending_ct_zones);
 
-            pinctrl_run(&ctx, &lports, br_int, chassis_id, &local_datapaths);
+            pinctrl_run(&lports, br_int, chassis_id, &local_datapaths);
             update_ct_zones(&all_lports, &patched_datapaths, &ct_zones,
                             ct_zone_bitmap, &pending_ct_zones);
             commit_ct_zones(&ctx, br_int, &pending_ct_zones);
@@ -594,7 +594,7 @@ main(int argc, char *argv[])
 
         if (br_int) {
             ofctrl_wait();
-            pinctrl_wait(&ctx);
+            pinctrl_wait();
         }
         ovsdb_idl_loop_commit_and_wait(&ovnsb_idl_loop);
         ovsdb_idl_track_clear(ovnsb_idl_loop.idl);
