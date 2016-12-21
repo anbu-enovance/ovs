@@ -68,7 +68,8 @@ struct simap;
     OVNACT(PUT_ND,        ovnact_put_mac_bind)      \
     OVNACT(PUT_DHCPV4_OPTS, ovnact_put_dhcp_opts)   \
     OVNACT(PUT_DHCPV6_OPTS, ovnact_put_dhcp_opts)   \
-    OVNACT(SET_QUEUE,       ovnact_set_queue)
+    OVNACT(SET_QUEUE,       ovnact_set_queue)       \
+    OVNACT(BCAST2LR,        ovnact_bcast2lr)
 
 /* enum ovnact_type, with a member OVNACT_<ENUM> for each action. */
 enum OVS_PACKED_ENUM ovnact_type {
@@ -234,6 +235,18 @@ struct ovnact_set_queue {
     uint16_t queue_id;
 };
 
+#define MC_LROUTER     "_MC_lrouter"
+#define MC_LROUTER_KEY 65533
+
+/* OVNACT_BCAST2LR */
+struct ovnact_bcast2lr {
+    struct ovnact ovnact;
+    const char *datapath;
+    const char *port;
+    const char *chassis;
+    bool is_this_chassis;
+};
+
 /* Internal use by the helpers below. */
 void ovnact_init(struct ovnact *, enum ovnact_type, size_t len);
 void *ovnact_put(struct ofpbuf *, enum ovnact_type, size_t len);
@@ -381,6 +394,8 @@ struct ovnact_parse_params {
     /* hmap of 'struct dhcp_opts_map'  to support 'put_dhcpv6_opts' action */
     const struct hmap *dhcpv6_opts;
 
+    /* The current chassis id */
+    const char *chassis_id;
     /* OVN maps each logical flow table (ltable), one-to-one, onto a physical
      * OpenFlow flow table (ptable).  A number of parameters describe this
      * mapping and data related to flow tables:
@@ -412,6 +427,12 @@ struct ovnact_encode_params {
      * '*portp' and returns true; otherwise, returns false. */
     bool (*lookup_port)(const void *aux, const char *port_name,
                         unsigned int *portp);
+    /* Looks up path keys of a port in datapath dp_uuid. If found, stores its
+     * port number in "*portp" and datapath number in "*datapathp". */
+    bool (*lookup_path)(const void *aux,
+                        const char *dp_uuid,
+                        const char *port_name,
+                        unsigned int *portp, unsigned int *datapathp);
     const void *aux;
 
     /* 'true' if the flow is for a switch. */

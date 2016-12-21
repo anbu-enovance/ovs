@@ -1660,6 +1660,131 @@ static void
 free_SET_QUEUE(struct ovnact_set_queue *a OVS_UNUSED)
 {
 }
+
+static void
+parse_BCAST2LR(struct action_context *ctx)
+{
+    struct ovnact_bcast2lr bc2lr = {
+        .datapath = NULL, .port = NULL, .chassis = NULL
+    };
+
+    if (lexer_match(ctx->lexer, LEX_T_LPAREN)) {
+        while (!lexer_match(ctx->lexer, LEX_T_RPAREN)) {
+            const char **keyp;
+
+            if (lexer_match_id(ctx->lexer, "datapath")) {
+                keyp = &bc2lr.datapath;
+            } else if (lexer_match_id(ctx->lexer, "port")) {
+                keyp = &bc2lr.port;
+            } else if (lexer_match_id(ctx->lexer, "chassis")) {
+                keyp = &bc2lr.chassis;
+            }
+
+            if (!lexer_force_match(ctx->lexer, LEX_T_EQUALS)
+                || ctx->lexer->token.type != LEX_T_STRING) {
+                return;
+            }
+            *keyp = xstrdup(ctx->lexer->token.s);
+            lexer_get(ctx->lexer);
+
+            lexer_match(ctx->lexer, LEX_T_COMMA);
+        }
+    }
+
+    if (!bc2lr.datapath || !bc2lr.port || !bc2lr.chassis) {
+        return;
+    }
+
+    bc2lr.is_this_chassis = !strcmp(ctx->pp->chassis_id,
+                              bc2lr.chassis);
+    struct ovnact_bcast2lr *b = ovnact_put_BCAST2LR(ctx->ovnacts);
+    b->chassis = bc2lr.chassis;
+    b->port = bc2lr.port;
+    b->datapath = bc2lr.datapath;
+    b->is_this_chassis = bc2lr.is_this_chassis;
+}
+
+static void
+format_BCAST2LR(const struct ovnact_bcast2lr *bc2lr, struct ds *s)
+{
+    ds_put_format(s, "bcast2lr(datapath=\"%s\", port=\"%s\", chassis=\"%s\");",
+                  bc2lr->datapath, bc2lr->port, bc2lr->chassis);
+}
+
+static void
+encode_BCAST2LR(const struct ovnact_bcast2lr *bc2lr,
+                const struct ovnact_encode_params *ep,
+                struct ofpbuf *ofpacts)
+{
+    if (!bc2lr->is_this_chassis) {
+        /* Nothing to be broadcasted from this chassis */
+        return;
+    }
+
+    unsigned int dp_key, port_key;
+    if (!ep->lookup_path(ep->aux, bc2lr->datapath, bc2lr->port,
+                         &dp_key, &port_key)) {
+        return;
+    }
+
+    ovs_be64 dp_key_be = htonll(dp_key);
+    port_key = htonl(port_key);
+
+    const ovs_be32 out_value = htonl(MC_LROUTER_KEY);
+    const struct mf_field *mf_dp = mf_from_id(MFF_LOG_DATAPATH);
+    const struct mf_field *mf_op = mf_from_id(MFF_LOG_OUTPORT);
+    const struct mf_field *mf_ip = mf_from_id(MFF_LOG_INPORT);
+    struct mf_subfield dp_field = {
+        .field = mf_dp,
+        .ofs = 0,
+        .n_bits = mf_dp->n_bits
+    };
+    struct mf_subfield op_field = {
+        .field = mf_op,
+        .ofs = 0,
+        .n_bits = mf_op->n_bits
+    };
+    struct mf_subfield ip_field = {
+        .field = mf_ip,
+        .ofs = 0,
+        .n_bits = mf_ip->n_bits
+    };
+
+    ofpact_put_STACK_PUSH(ofpacts)->subfield = dp_field;
+    ofpact_put_STACK_PUSH(ofpacts)->subfield = op_field;
+    ofpact_put_STACK_PUSH(ofpacts)->subfield = ip_field;
+
+    struct ofpact_set_field *sf_dp = ofpact_put_set_field(ofpacts,
+                                                          mf_dp,
+                                                          NULL,
+                                                          NULL);
+    bitwise_copy(&dp_key_be, 8, 0, sf_dp->value,
+                 sf_dp->field->n_bytes, 0, mf_dp->n_bits);
+    bitwise_one(ofpact_set_field_mask(sf_dp), sf_dp->field->n_bytes, 0, mf_dp->n_bits);
+
+
+    ofpact_put_set_field(ofpacts,
+                         mf_ip, &port_key,
+                         NULL);
+
+    ofpact_put_set_field(ofpacts,
+                         mf_op, &out_value,
+                         NULL);
+    emit_resubmit(ofpacts, ep->output_ptable);
+
+    ofpact_put_STACK_POP(ofpacts)->subfield = ip_field;
+    ofpact_put_STACK_POP(ofpacts)->subfield = op_field;
+    ofpact_put_STACK_POP(ofpacts)->subfield = dp_field;
+}
+
+static void
+free_BCAST2LR(struct ovnact_bcast2lr *bc2lr)
+{
+    free((void *)bc2lr->chassis);
+    free((void *)bc2lr->port);
+    free((void *)bc2lr->datapath);
+}
+
 
 /* Parses an assignment or exchange or put_dhcp_opts action. */
 static void
@@ -1733,6 +1858,8 @@ parse_action(struct action_context *ctx)
         parse_put_mac_bind(ctx, 128, ovnact_put_PUT_ND(ctx->ovnacts));
     } else if (lexer_match_id(ctx->lexer, "set_queue")) {
         parse_SET_QUEUE(ctx);
+    } else if (lexer_match_id(ctx->lexer, "bcast2lr")) {
+        parse_BCAST2LR(ctx);
     } else {
         lexer_syntax_error(ctx->lexer, "expecting action");
     }
@@ -1866,6 +1993,7 @@ static void
 ovnact_encode(const struct ovnact *a, const struct ovnact_encode_params *ep,
               struct ofpbuf *ofpacts)
 {
+
     switch (a->type) {
 #define OVNACT(ENUM, STRUCT)                                            \
         case OVNACT_##ENUM:                                             \

@@ -29,6 +29,7 @@
 #include "ovn-controller.h"
 #include "ovn/lib/ovn-sb-idl.h"
 #include "ovn/lib/ovn-util.h"
+#include "ovn/actions.h"
 #include "physical.h"
 #include "openvswitch/shash.h"
 #include "simap.h"
@@ -59,6 +60,11 @@ physical_register_ovs_idl(struct ovsdb_idl *ovs_idl)
 static struct simap localvif_to_ofport =
     SIMAP_INITIALIZER(&localvif_to_ofport);
 static struct hmap tunnels = HMAP_INITIALIZER(&tunnels);
+
+struct dp_key {
+    uint64_t tunnel_key;
+    struct ovs_list list;
+};
 
 /* Maps from a chassis to the OpenFlow port number of the tunnel that can be
  * used to reach that chassis. */
@@ -568,7 +574,8 @@ consider_mc_group(enum mf_field_id mff_ovn_geneve,
                   const struct sbrec_multicast_group *mc,
                   struct ofpbuf *ofpacts_p,
                   struct ofpbuf *remote_ofpacts_p,
-                  struct hmap *flow_table)
+                  struct hmap *flow_table,
+                  struct sset *bcast_chassis)
 {
     uint32_t dp_key = mc->datapath->tunnel_key;
     if (!get_local_datapath(local_datapaths, dp_key)) {
@@ -576,6 +583,7 @@ consider_mc_group(enum mf_field_id mff_ovn_geneve,
     }
 
     struct sset remote_chassis = SSET_INITIALIZER(&remote_chassis);
+    bool is_this_chassis_bcasting = false;
     struct match match;
 
     match_init_catchall(&match);
@@ -612,10 +620,21 @@ consider_mc_group(enum mf_field_id mff_ovn_geneve,
             put_load(zone_id, MFF_LOG_CT_ZONE, 0, 32, ofpacts_p);
         }
 
-        if (!strcmp(port->type, "patch")) {
+        if (!strcmp(mc->name, MC_LROUTER)) {
+            const char *arp_bcast_chassis = smap_get(&port->options,
+                                                     "arp-bcast-chassis");
+            if (arp_bcast_chassis) {
+                if (!strcmp(arp_bcast_chassis, chassis->name)) {
+                    is_this_chassis_bcasting = true;
+                } else {
+                    sset_add(bcast_chassis, arp_bcast_chassis);
+                }
+            }
+        } else if (!strcmp(port->type, "patch")) {
             put_load(port->tunnel_key, MFF_LOG_OUTPORT, 0, 32,
                      remote_ofpacts_p);
             put_resubmit(OFTABLE_CHECK_LOOPBACK, remote_ofpacts_p);
+
         } else if (simap_contains(&localvif_to_ofport,
                            (port->parent_port && *port->parent_port)
                            ? port->parent_port : port->logical_port)
@@ -629,6 +648,17 @@ consider_mc_group(enum mf_field_id mff_ovn_geneve,
              * otherwise multicast will reach remote ports through localnet
              * port. */
             sset_add(&remote_chassis, port->chassis->name);
+        }
+    }
+
+    if (is_this_chassis_bcasting) {
+        /* Send to all the chassis except this */
+        struct chassis_tunnel *tun;
+        HMAP_FOR_EACH (tun, hmap_node, &tunnels) {
+            if (!strcmp(tun->chassis_id, chassis->name)) {
+                continue;
+            }
+            sset_add(&remote_chassis, tun->chassis_id);
         }
     }
 
@@ -839,10 +869,28 @@ physical_run(struct controller_ctx *ctx, enum mf_field_id mff_ovn_geneve,
     /* Handle output to multicast groups, in tables 32 and 33. */
     const struct sbrec_multicast_group *mc;
     struct ofpbuf remote_ofpacts;
+    struct shash bcast_chassis_dps = SHASH_INITIALIZER(&bcast_chassis_dps);
+
     ofpbuf_init(&remote_ofpacts, 0);
     SBREC_MULTICAST_GROUP_FOR_EACH (mc, ctx->ovnsb_idl) {
+        struct sset bcast_chassis = SSET_INITIALIZER(&bcast_chassis);
         consider_mc_group(mff_ovn_geneve, ct_zones, local_datapaths, chassis,
-                          mc, &ofpacts, &remote_ofpacts, flow_table);
+                          mc, &ofpacts, &remote_ofpacts, flow_table,
+                          &bcast_chassis);
+
+        const char *chassis_name;
+        SSET_FOR_EACH(chassis_name, &bcast_chassis) {
+            struct shash_node *this_node = shash_find(&bcast_chassis_dps, chassis_name);
+            struct dp_key *dp_key = xmalloc(sizeof(*dp_key));
+            dp_key->tunnel_key = mc->datapath->tunnel_key;
+            if (!this_node) {
+                struct ovs_list *list = xmalloc(sizeof(*list));
+                ovs_list_init(list);
+                this_node = shash_add(&bcast_chassis_dps, chassis_name, list);
+            }
+            ovs_list_push_back((struct ovs_list *)this_node->data, &dp_key->list);
+        }
+        sset_destroy(&bcast_chassis);
     }
 
     ofpbuf_uninit(&remote_ofpacts);
@@ -880,11 +928,29 @@ physical_run(struct controller_ctx *ctx, enum mf_field_id mff_ovn_geneve,
             OVS_NOT_REACHED();
         }
 
-        put_resubmit(OFTABLE_LOCAL_OUTPUT, &ofpacts);
+        /* If this tunnel is found in the chassis list, add an additiona flow*/
+        struct shash_node *this_node = shash_find(&bcast_chassis_dps, tun->chassis_id);
+        if (this_node) {
+            struct ofpbuf *bcast2lr_ofpacts = ofpbuf_clone(&ofpacts);
+            struct match  tun_match = MATCH_CATCHALL_INITIALIZER;
+            struct dp_key *dp_key;
 
+            match_set_in_port(&tun_match, tun->ofport);
+            put_resubmit(OFTABLE_LOG_INGRESS_PIPELINE, bcast2lr_ofpacts);
+
+            LIST_FOR_EACH_POP(dp_key, list, (struct ovs_list *)this_node->data) {
+                match_set_tun_id(&tun_match, htonll(dp_key->tunnel_key));
+            }
+            ofctrl_add_flow(flow_table, OFTABLE_PHY_TO_LOG, 150,
+                            &tun_match, bcast2lr_ofpacts);
+            ofpbuf_delete(bcast2lr_ofpacts);
+            shash_delete(&bcast_chassis_dps, this_node);
+        }
+        put_resubmit(OFTABLE_LOCAL_OUTPUT, &ofpacts);
         ofctrl_add_flow(flow_table, OFTABLE_PHY_TO_LOG, 100, &match, &ofpacts);
     }
 
+    shash_destroy(&bcast_chassis_dps);
     /* Add flows for VXLAN encapsulations.  Due to the limited amount of
      * metadata, we only support VXLAN for connections to gateways.  The
      * VNI is used to populate MFF_LOG_DATAPATH.  The gateway's logical

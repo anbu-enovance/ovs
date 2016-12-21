@@ -871,8 +871,8 @@
           <p>
             Implemented by storing arguments into OpenFlow fields, then
             resubmitting to table 66, which <code>ovn-controller</code>
-            populates with flows generated from the <code>MAC_Binding</code>
-            table in the OVN Southbound database.  If there is a match in table
+            populates with flows generated from the MAC binding cache
+            updated from the arp broadcasts. If there is a match in table
             66, then its actions store the bound MAC in the Ethernet
             destination address field.
           </p>
@@ -890,7 +890,7 @@
           <p>
             Implemented by storing the arguments into OpenFlow fields, then
             outputting a packet to <code>ovn-controller</code>, which updates
-            the <code>MAC_Binding</code> table.
+            a local in-memory cache for MAC bindings.
           </p>
 
           <p>

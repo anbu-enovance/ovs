@@ -169,13 +169,11 @@ update_sb_monitors(struct ovsdb_idl *ovnsb_idl,
             sbrec_port_binding_add_clause_datapath(&pb, OVSDB_F_EQ, uuid);
             sbrec_logical_flow_add_clause_logical_datapath(&lf, OVSDB_F_EQ,
                                                            uuid);
-            sbrec_mac_binding_add_clause_datapath(&mb, OVSDB_F_EQ, uuid);
             sbrec_multicast_group_add_clause_datapath(&mg, OVSDB_F_EQ, uuid);
         }
     }
     sbrec_port_binding_set_condition(ovnsb_idl, &pb);
     sbrec_logical_flow_set_condition(ovnsb_idl, &lf);
-    sbrec_mac_binding_set_condition(ovnsb_idl, &mb);
     sbrec_multicast_group_set_condition(ovnsb_idl, &mg);
     ovsdb_idl_condition_destroy(&pb);
     ovsdb_idl_condition_destroy(&lf);
@@ -585,7 +583,7 @@ main(int argc, char *argv[])
             enum mf_field_id mff_ovn_geneve = ofctrl_run(br_int,
                                                          &pending_ct_zones);
 
-            pinctrl_run(&ctx, &lports, br_int, chassis, &local_datapaths);
+            pinctrl_run(&lports, br_int, chassis, &local_datapaths);
             update_ct_zones(&local_lports, &local_datapaths, &ct_zones,
                             ct_zone_bitmap, &pending_ct_zones);
             if (ctx.ovs_idl_txn) {
@@ -593,7 +591,7 @@ main(int argc, char *argv[])
 
                 struct hmap flow_table = HMAP_INITIALIZER(&flow_table);
                 lflow_run(&ctx, &lports, &mcgroups, &local_datapaths,
-                          &group_table, &ct_zones, &flow_table);
+                          &group_table, &ct_zones, &flow_table, chassis_id);
 
                 physical_run(&ctx, mff_ovn_geneve,
                              br_int, chassis, &ct_zones, &lports,
@@ -636,7 +634,7 @@ main(int argc, char *argv[])
 
         if (br_int) {
             ofctrl_wait();
-            pinctrl_wait(&ctx);
+            pinctrl_wait();
         }
         ovsdb_idl_loop_commit_and_wait(&ovnsb_idl_loop);
 

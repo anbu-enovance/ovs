@@ -111,7 +111,8 @@ enum ovn_stage {
     PIPELINE_STAGE(SWITCH, IN,  ARP_ND_RSP,    10, "ls_in_arp_rsp")       \
     PIPELINE_STAGE(SWITCH, IN,  DHCP_OPTIONS,  11, "ls_in_dhcp_options")  \
     PIPELINE_STAGE(SWITCH, IN,  DHCP_RESPONSE, 12, "ls_in_dhcp_response") \
-    PIPELINE_STAGE(SWITCH, IN,  L2_LKUP,       13, "ls_in_l2_lkup")       \
+    PIPELINE_STAGE(SWITCH, IN,  DYN_ARP_BCAST, 13, "ls_in_dynamic_arp_bcast") \
+    PIPELINE_STAGE(SWITCH, IN,  L2_LKUP,       14, "ls_in_l2_lkup")      \
                                                                       \
     /* Logical switch egress stages. */                               \
     PIPELINE_STAGE(SWITCH, OUT, PRE_LB,       0, "ls_out_pre_lb")     \
@@ -378,7 +379,7 @@ struct ovn_datapath {
     struct hmap port_tnlids;
     uint32_t port_key_hint;
 
-    bool has_unknown;
+    struct ovn_port *unknown_port;
 
     /* IPAM data. */
     struct hmap ipam;
@@ -1443,19 +1444,6 @@ ovn_port_update_sbrec(const struct ovn_port *op,
     }
 }
 
-/* Remove mac_binding entries that refer to logical_ports which are
- * deleted. */
-static void
-cleanup_mac_bindings(struct northd_context *ctx, struct hmap *ports)
-{
-    const struct sbrec_mac_binding *b, *n;
-    SBREC_MAC_BINDING_FOR_EACH_SAFE (b, n, ctx->ovnsb_idl) {
-        if (!ovn_port_find(ports, b->logical_port)) {
-            sbrec_mac_binding_delete(b);
-        }
-    }
-}
-
 /* Updates the southbound Port_Binding table so that it contains the logical
  * switch ports specified by the northbound database.
  *
@@ -1504,19 +1492,11 @@ build_ports(struct northd_context *ctx, struct hmap *datapaths,
         sbrec_port_binding_set_tunnel_key(op->sb, tunnel_key);
     }
 
-    bool remove_mac_bindings = false;
-    if (!ovs_list_is_empty(&sb_only)) {
-        remove_mac_bindings = true;
-    }
-
     /* Delete southbound records without northbound matches. */
     LIST_FOR_EACH_SAFE(op, next, list, &sb_only) {
         ovs_list_remove(&op->list);
         sbrec_port_binding_delete(op->sb);
         ovn_port_destroy(ports, op);
-    }
-    if (remove_mac_bindings) {
-        cleanup_mac_bindings(ctx, ports);
     }
 
     tag_alloc_destroy(&tag_alloc_table);
@@ -1536,6 +1516,8 @@ static const struct multicast_group mc_flood = { MC_FLOOD, 65535 };
 
 #define MC_UNKNOWN "_MC_unknown"
 static const struct multicast_group mc_unknown = { MC_UNKNOWN, 65534 };
+
+static const struct multicast_group mc_lrouter = { MC_LROUTER, MC_LROUTER_KEY };
 
 static bool
 multicast_group_equal(const struct multicast_group *a,
@@ -3061,9 +3043,10 @@ build_lswitch_flows(struct hmap *datapaths, struct hmap *ports,
 
         ovn_lflow_add(lflows, od, S_SWITCH_IN_DHCP_OPTIONS, 0, "1", "next;");
         ovn_lflow_add(lflows, od, S_SWITCH_IN_DHCP_RESPONSE, 0, "1", "next;");
+        ovn_lflow_add(lflows, od, S_SWITCH_IN_DYN_ARP_BCAST, 0, "1", "next;");
     }
 
-    /* Ingress table 13: Destination lookup, broadcast and multicast handling
+    /* Ingress table 14: Destination lookup, broadcast and multicast handling
      * (priority 100). */
     HMAP_FOR_EACH (op, key_node, ports) {
         if (!op->nbsp) {
@@ -3107,7 +3090,7 @@ build_lswitch_flows(struct hmap *datapaths, struct hmap *ports,
             } else if (!strcmp(op->nbsp->addresses[i], "unknown")) {
                 if (lsp_is_enabled(op->nbsp)) {
                     ovn_multicast_add(mcgroups, &mc_unknown, op);
-                    op->od->has_unknown = true;
+                    op->od->unknown_port = op;
                 }
             } else if (is_dynamic_lsp_address(op->nbsp->addresses[i])) {
                 if (!op->nbsp->dynamic_addresses
@@ -3139,7 +3122,48 @@ build_lswitch_flows(struct hmap *datapaths, struct hmap *ports,
             continue;
         }
 
-        if (od->has_unknown) {
+        if (od->unknown_port) {
+            if ( od->unknown_port->sb->chassis) {
+                for (int i = 0; i < od->n_router_ports; i++) {
+                    struct ovn_port *peer = od->router_ports[i]->peer;
+                    if (!peer) {
+                        continue;
+                    }
+
+                    ds_clear(&match);
+                    ds_clear(&actions);
+                    ds_put_format(
+                        &match,
+                        "inport == \"%s\" && arp.op == 2 /* ARP reply */"
+                        " && eth.dst == %s",
+                        od->unknown_port->key,
+                        peer->lrp_networks.ea_s);
+
+                    ds_put_format(
+                        &actions,
+                        "bcast2lr(""datapath=\""UUID_FMT"\", port=\"%s\", "
+                        "chassis=\"%s\");  next;",
+                        UUID_ARGS(&peer->od->sb->header_.uuid),
+                        peer->sb->logical_port,
+                        od->unknown_port->sb->chassis->name);
+
+                    struct smap opts;
+                    smap_clone(&opts, &peer->sb->options);
+                    smap_add(&opts,
+                             "arp-bcast-chassis",
+                             od->unknown_port->sb->chassis->name);
+                    sbrec_port_binding_set_options(
+                        peer->sb,
+                        &opts);
+                    smap_destroy(&opts);
+                    /* Broadcast arp responses to the router datapath */
+                    ovn_lflow_add(lflows, od, S_SWITCH_IN_DYN_ARP_BCAST, 100,
+                                  ds_cstr(&match),
+                                  ds_cstr(&actions));
+                    ovn_multicast_add(mcgroups, &mc_lrouter,
+                                      peer);
+                }
+            }
             ovn_lflow_add(lflows, od, S_SWITCH_IN_L2_LKUP, 0, "1",
                           "outport = \""MC_UNKNOWN"\"; output;");
         }
@@ -3317,7 +3341,7 @@ build_static_route_flow(struct hmap *lflows, struct ovn_datapath *od,
                         const struct nbrec_logical_router_static_route *route)
 {
     ovs_be32 nexthop;
-    const char *lrp_addr_s;
+    const char *lrp_addr_s = NULL;
     unsigned int plen;
     bool is_ipv4;
 
@@ -4977,12 +5001,6 @@ main(int argc, char *argv[])
     add_column_noalert(ovnsb_idl_loop.idl, &sbrec_port_binding_col_options);
     add_column_noalert(ovnsb_idl_loop.idl, &sbrec_port_binding_col_mac);
     ovsdb_idl_add_column(ovnsb_idl_loop.idl, &sbrec_port_binding_col_chassis);
-    ovsdb_idl_add_table(ovnsb_idl_loop.idl, &sbrec_table_mac_binding);
-    add_column_noalert(ovnsb_idl_loop.idl, &sbrec_mac_binding_col_datapath);
-    add_column_noalert(ovnsb_idl_loop.idl, &sbrec_mac_binding_col_ip);
-    add_column_noalert(ovnsb_idl_loop.idl, &sbrec_mac_binding_col_mac);
-    add_column_noalert(ovnsb_idl_loop.idl,
-                       &sbrec_mac_binding_col_logical_port);
     ovsdb_idl_add_table(ovnsb_idl_loop.idl, &sbrec_table_dhcp_options);
     add_column_noalert(ovnsb_idl_loop.idl, &sbrec_dhcp_options_col_code);
     add_column_noalert(ovnsb_idl_loop.idl, &sbrec_dhcp_options_col_type);
@@ -4997,6 +5015,8 @@ main(int argc, char *argv[])
 
     ovsdb_idl_add_table(ovnsb_idl_loop.idl, &sbrec_table_chassis);
     ovsdb_idl_add_column(ovnsb_idl_loop.idl, &sbrec_chassis_col_nb_cfg);
+    ovsdb_idl_add_column(ovnsb_idl_loop.idl, &sbrec_chassis_col_name);
+    add_column_noalert(ovnsb_idl_loop.idl, &sbrec_chassis_col_name);
 
     /* Main loop. */
     exiting = false;

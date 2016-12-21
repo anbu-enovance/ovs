@@ -59,9 +59,6 @@ static void pinctrl_handle_put_mac_binding(const struct flow *md,
                                            bool is_arp);
 static void init_put_mac_bindings(void);
 static void destroy_put_mac_bindings(void);
-static void run_put_mac_bindings(struct controller_ctx *,
-                                 const struct lport_index *lports);
-static void wait_put_mac_bindings(struct controller_ctx *);
 static void flush_put_mac_bindings(void);
 
 static void init_send_garps(void);
@@ -750,7 +747,7 @@ pinctrl_recv(const struct ofp_header *oh, enum ofptype type)
 }
 
 void
-pinctrl_run(struct controller_ctx *ctx, const struct lport_index *lports,
+pinctrl_run(const struct lport_index *lports,
             const struct ovsrec_bridge *br_int,
             const struct sbrec_chassis *chassis,
             struct hmap *local_datapaths)
@@ -768,7 +765,6 @@ pinctrl_run(struct controller_ctx *ctx, const struct lport_index *lports,
         if (conn_seq_no != rconn_get_connection_seqno(swconn)) {
             pinctrl_setup(swconn);
             conn_seq_no = rconn_get_connection_seqno(swconn);
-            flush_put_mac_bindings();
         }
 
         /* Process a limited number of messages per call. */
@@ -787,14 +783,12 @@ pinctrl_run(struct controller_ctx *ctx, const struct lport_index *lports,
         }
     }
 
-    run_put_mac_bindings(ctx, lports);
     send_garp_run(br_int, chassis, lports, local_datapaths);
 }
 
 void
-pinctrl_wait(struct controller_ctx *ctx)
+pinctrl_wait(void)
 {
-    wait_put_mac_bindings(ctx);
     rconn_run_wait(swconn);
     rconn_recv_wait(swconn);
     send_garp_wait();
@@ -811,13 +805,9 @@ pinctrl_destroy(void)
 /* Implementation of the "put_arp" and "put_nd" OVN actions.  These
  * actions send a packet to ovn-controller, using the flow as an API
  * (see actions.h for details).  This code implements the actions by
- * updating the MAC_Binding table in the southbound database.
+ * updating the local in-memory cache of the mac bindings
  *
- * This code could be a lot simpler if the database could always be updated,
- * but in fact we can only update it when ctx->ovnsb_idl_txn is nonnull.  Thus,
- * we buffer up a few put_mac_bindings (but we don't keep them longer
- * than 1 second) and apply them whenever a database transaction is
- * available. */
+ * */
 
 /* Buffered "put_mac_binding" operation. */
 struct put_mac_binding {
@@ -899,74 +889,18 @@ pinctrl_handle_put_mac_binding(const struct flow *md,
     pmb->mac = headers->dl_src;
 }
 
-static void
-run_put_mac_binding(struct controller_ctx *ctx,
-                    const struct lport_index *lports,
-                    const struct put_mac_binding *pmb)
-{
-    if (time_msec() > pmb->timestamp + 1000) {
-        return;
-    }
-
-    /* Convert logical datapath and logical port key into lport. */
-    const struct sbrec_port_binding *pb
-        = lport_lookup_by_key(lports, pmb->dp_key, pmb->port_key);
-    if (!pb) {
-        static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(1, 5);
-
-        VLOG_WARN_RL(&rl, "unknown logical port with datapath %"PRIu32" "
-                     "and port %"PRIu32, pmb->dp_key, pmb->port_key);
-        return;
-    }
-
-    /* Convert ethernet argument to string form for database. */
-    char mac_string[ETH_ADDR_STRLEN + 1];
-    snprintf(mac_string, sizeof mac_string,
-             ETH_ADDR_FMT, ETH_ADDR_ARGS(pmb->mac));
-
-    /* Check for an update an existing IP-MAC binding for this logical
-     * port.
-     *
-     * XXX This is not very efficient. */
-    const struct sbrec_mac_binding *b;
-    SBREC_MAC_BINDING_FOR_EACH (b, ctx->ovnsb_idl) {
-        if (!strcmp(b->logical_port, pb->logical_port)
-            && !strcmp(b->ip, pmb->ip_s)) {
-            if (strcmp(b->mac, mac_string)) {
-                sbrec_mac_binding_set_mac(b, mac_string);
-            }
-            return;
-        }
-    }
-
-    /* Add new IP-MAC binding for this logical port. */
-    b = sbrec_mac_binding_insert(ctx->ovnsb_idl_txn);
-    sbrec_mac_binding_set_logical_port(b, pb->logical_port);
-    sbrec_mac_binding_set_ip(b, pmb->ip_s);
-    sbrec_mac_binding_set_mac(b, mac_string);
-    sbrec_mac_binding_set_datapath(b, pb->datapath);
-}
-
-static void
-run_put_mac_bindings(struct controller_ctx *ctx,
-                     const struct lport_index *lports)
-{
-    if (!ctx->ovnsb_idl_txn) {
-        return;
-    }
-
+void
+pinctrl_put_mac_binding_for_each(void (*iteration_cb)(void *private_data,
+                                                      uint32_t port_key,
+                                                      uint32_t dp_key,
+                                                      const char *ip_s,
+                                                      const struct eth_addr *mac),
+                                 void *private_data) {
     const struct put_mac_binding *pmb;
     HMAP_FOR_EACH (pmb, hmap_node, &put_mac_bindings) {
-        run_put_mac_binding(ctx, lports, pmb);
-    }
-    flush_put_mac_bindings();
-}
-
-static void
-wait_put_mac_bindings(struct controller_ctx *ctx)
-{
-    if (ctx->ovnsb_idl_txn && !hmap_is_empty(&put_mac_bindings)) {
-        poll_immediate_wake();
+        iteration_cb(private_data, pmb->port_key,
+                     pmb->dp_key, pmb->ip_s,
+                     &pmb->mac);
     }
 }
 
